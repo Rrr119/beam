@@ -32,10 +32,67 @@ from apache_beam.utils import timestamp
 __all__ = [
     'Deduplicate',
     'DeduplicatePerKey',
+    'DeduplicatePerWindow',
+    'DeduplicateWindowed',
 ]
 
 K = typing.TypeVar('K')
 V = typing.TypeVar('V')
+
+
+def _validate_durations(
+    transform_name, processing_time_duration, event_time_duration):
+  if processing_time_duration is None and event_time_duration is None:
+    raise ValueError(
+        '%s requires at least providing either '
+        'processing_time_duration or event_time_duration.' % transform_name)
+
+
+def _create_deduplicate_fn(processing_time_duration, event_time_duration):
+  """Creates a stateful DoFn which marks a key as seen within each window.
+
+  The seen marker is kept in a :class:`BagStateSpec` rather than a value
+  (read-modify-write) state. Bag state is mergeable, which is required for
+  correctness on merging window functions such as
+  :class:`~apache_beam.transforms.window.Sessions`: when windows merge the
+  marker state of every merged-away window is carried over into the merged
+  result window. Value state is not mergeable and would either be dropped or
+  rejected by the runner when windows merge.
+  """
+  processing_timer_spec = userstate.TimerSpec(
+      'processing_timer', TimeDomain.REAL_TIME)
+  event_timer_spec = userstate.TimerSpec('event_timer', TimeDomain.WATERMARK)
+  state_spec = userstate.BagStateSpec('seen', BooleanCoder())
+
+  class DeduplicationFn(core.DoFn):
+    def process(
+        self,
+        kv,
+        ts=core.DoFn.TimestampParam,
+        seen_state=core.DoFn.StateParam(state_spec),
+        processing_timer=core.DoFn.TimerParam(processing_timer_spec),
+        event_timer=core.DoFn.TimerParam(event_timer_spec)):
+      if True in seen_state.read():
+        return
+
+      if processing_time_duration is not None:
+        processing_timer.set(
+            timestamp.Timestamp.now() + processing_time_duration)
+      if event_time_duration is not None:
+        event_timer.set(ts + event_time_duration)
+      seen_state.add(True)
+      yield kv
+
+    @userstate.on_timer(processing_timer_spec)
+    def process_processing_timer(
+        self, seen_state=core.DoFn.StateParam(state_spec)):
+      seen_state.clear()
+
+    @userstate.on_timer(event_timer_spec)
+    def process_event_timer(self, seen_state=core.DoFn.StateParam(state_spec)):
+      seen_state.clear()
+
+  return DeduplicationFn()
 
 
 @typehints.with_input_types(tuple[K, V])
@@ -56,56 +113,70 @@ class DeduplicatePerKey(ptransform.PTransform):
   Does not preserve any order the input PCollection might have had.
   """
   def __init__(self, processing_time_duration=None, event_time_duration=None):
-    if processing_time_duration is None and event_time_duration is None:
-      raise ValueError(
-          'DeduplicatePerKey requires at lease provide either'
-          'processing_time_duration or event_time_duration.')
+    _validate_durations(
+        'DeduplicatePerKey', processing_time_duration, event_time_duration)
     self.processing_time_duration = processing_time_duration
     self.event_time_duration = event_time_duration
 
   def _create_deduplicate_fn(self):
-    processing_timer_spec = userstate.TimerSpec(
-        'processing_timer', TimeDomain.REAL_TIME)
-    event_timer_spec = userstate.TimerSpec('event_timer', TimeDomain.WATERMARK)
-    state_spec = userstate.BagStateSpec('seen', BooleanCoder())
-    processing_time_duration = self.processing_time_duration
-    event_time_duration = self.event_time_duration
-
-    class DeduplicationFn(core.DoFn):
-      def process(
-          self,
-          kv,
-          ts=core.DoFn.TimestampParam,
-          seen_state=core.DoFn.StateParam(state_spec),
-          processing_timer=core.DoFn.TimerParam(processing_timer_spec),
-          event_timer=core.DoFn.TimerParam(event_timer_spec)):
-        if True in seen_state.read():
-          return
-
-        if processing_time_duration is not None:
-          processing_timer.set(
-              timestamp.Timestamp.now() + processing_time_duration)
-        if event_time_duration is not None:
-          event_timer.set(ts + event_time_duration)
-        seen_state.add(True)
-        yield kv
-
-      @userstate.on_timer(processing_timer_spec)
-      def process_processing_timer(
-          self, seen_state=core.DoFn.StateParam(state_spec)):
-        seen_state.clear()
-
-      @userstate.on_timer(event_timer_spec)
-      def process_event_timer(
-          self, seen_state=core.DoFn.StateParam(state_spec)):
-        seen_state.clear()
-
-    return DeduplicationFn()
+    return _create_deduplicate_fn(
+        self.processing_time_duration, self.event_time_duration)
 
   def expand(self, pcoll):
     return (
         pcoll
         | 'DeduplicateFn' >> core.ParDo(self._create_deduplicate_fn()))
+
+
+@typehints.with_input_types(tuple[K, V])
+@typehints.with_output_types(tuple[K, V])
+class DeduplicatePerWindow(ptransform.PTransform):
+  """Deduplicates ``<key, value>`` pairs while being window aware.
+
+  Elements in different windows are never considered duplicates of each
+  other. Unlike :class:`DeduplicatePerKey`, this transform works correctly
+  with merging window functions such as
+  :class:`~apache_beam.transforms.window.Sessions` as well as non-merging
+  window functions such as
+  :class:`~apache_beam.transforms.window.FixedWindows` and
+  :class:`~apache_beam.transforms.window.SlidingWindows`.
+
+  Window merging is driven by a grouping operation (e.g. ``GroupByKey``).
+  When the input is windowed with a merging window function, an internal
+  ``GroupByKey`` is applied before the stateful deduplication step so that
+  session windows are merged first. The deduplication state itself is stored
+  in mergeable bag state, which means the "already seen" marker survives the
+  window merge on every state backend that supports the Beam state and timer
+  APIs (read-modify-write/value state is not mergeable and cannot be used
+  here).
+
+  Time durations bound the amount of state retained. At least one of
+  ``processing_time_duration`` or ``event_time_duration`` must be provided.
+
+  Does not preserve any order the input PCollection might have had.
+  """
+  def __init__(self, processing_time_duration=None, event_time_duration=None):
+    _validate_durations(
+        'DeduplicatePerWindow', processing_time_duration, event_time_duration)
+    self.processing_time_duration = processing_time_duration
+    self.event_time_duration = event_time_duration
+
+  def expand(self, pcoll):
+    if pcoll.windowing.windowfn.is_merging():
+      # A grouping operation is required to merge windows before the
+      # stateful deduplication DoFn runs; otherwise elements belonging to
+      # windows that should have been merged would keep independent state
+      # and duplicates would be emitted once per unmerged window.
+      pcoll = (
+          pcoll
+          | 'MergeWindows' >> core.GroupByKey()
+          | 'ExplodeValues' >>
+          core.FlatMap(lambda kv: ((kv[0], value) for value in kv[1])))
+    return (
+        pcoll
+        | 'DeduplicateFn' >> core.ParDo(
+            _create_deduplicate_fn(
+                self.processing_time_duration, self.event_time_duration)))
 
 
 class Deduplicate(ptransform.PTransform):
@@ -114,10 +185,8 @@ class Deduplicate(ptransform.PTransform):
   time duration.
   """
   def __init__(self, processing_time_duration=None, event_time_duration=None):
-    if processing_time_duration is None and event_time_duration is None:
-      raise ValueError(
-          'Deduplicate requires at least providing either '
-          'processing_time_duration or event_time_duration.')
+    _validate_durations(
+        'Deduplicate', processing_time_duration, event_time_duration)
     self.processing_time_duration = processing_time_duration
     self.event_time_duration = event_time_duration
 
@@ -126,6 +195,33 @@ class Deduplicate(ptransform.PTransform):
         pcoll
         | 'Use Value as Key' >> core.Map(lambda x: (x, None))
         | 'DeduplicatePerKey' >> DeduplicatePerKey(
+            processing_time_duration=self.processing_time_duration,
+            event_time_duration=self.event_time_duration)
+        | 'Output Value' >> core.Map(lambda kv: kv[0]))
+
+
+class DeduplicateWindowed(ptransform.PTransform):
+  """Window-aware counterpart of :class:`Deduplicate`.
+
+  Takes any arbitrary value as input and uses the value itself as the key to
+  deduplicate within each window. Deduplication is performed independently per
+  window, and both merging (``Sessions``) and non-merging (``FixedWindows``,
+  ``SlidingWindows``) window functions are supported.
+
+  See :class:`DeduplicatePerWindow` for details on how window merging and
+  state backend compatibility are handled.
+  """
+  def __init__(self, processing_time_duration=None, event_time_duration=None):
+    _validate_durations(
+        'DeduplicateWindowed', processing_time_duration, event_time_duration)
+    self.processing_time_duration = processing_time_duration
+    self.event_time_duration = event_time_duration
+
+  def expand(self, pcoll):
+    return (
+        pcoll
+        | 'Use Value as Key' >> core.Map(lambda x: (x, None))
+        | 'DeduplicatePerWindow' >> DeduplicatePerWindow(
             processing_time_duration=self.processing_time_duration,
             event_time_duration=self.event_time_duration)
         | 'Output Value' >> core.Map(lambda kv: kv[0]))
